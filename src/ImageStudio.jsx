@@ -235,6 +235,8 @@ export default function ImageStudio() {
   });
   const [dragOver, setDragOver] = useState(false);
   const [viewMode, setViewMode] = useState("result"); // "original" | "result"
+  const [bgMode, setBgMode] = useState("fast"); // "fast" | "ai"
+  const [aiStatus, setAiStatus] = useState(""); // "", "loading", "ready", "error"
   const [spoitMode, setSpoitMode] = useState(false);
   const [spoitSensitivity, setSpoitSensitivity] = useState(25);
   const [resultCanvas, setResultCanvas] = useState(null);
@@ -281,33 +283,77 @@ export default function ImageStudio() {
 
     await new Promise(r => setTimeout(r, 50));
 
-    // Step 1: Upscale
-    setStep("확대 중...");
-    setProgress(15);
-    await new Promise(r => setTimeout(r, 100));
-    const upscaled = ImageEngine.upscale(original, settings.scale);
-    setProgress(35);
+    try {
+      // Step 1: Upscale
+      setStep("확대 중...");
+      setProgress(15);
+      await new Promise(r => setTimeout(r, 100));
+      const upscaled = ImageEngine.upscale(original, settings.scale);
+      setProgress(35);
 
-    // Step 2: Remove Background
-    setStep("배경 제거 중...");
-    await new Promise(r => setTimeout(r, 100));
-    const nobg = ImageEngine.removeBackground(upscaled, settings.sensitivity, settings.trim);
-    setProgress(75);
+      let nobg;
 
-    // Step 3: Auto Crop
-    setStep("자동 크롭 중...");
-    await new Promise(r => setTimeout(r, 100));
-    const cropped = ImageEngine.autoCrop(nobg, settings.padding);
-    setProgress(100);
+      if (bgMode === "ai") {
+        // AI Background Removal
+        setStep("AI 모델 로딩 중...");
+        setProgress(40);
 
-    setResult(cropped.toDataURL("image/png"));
-    setResultCanvas(cropped);
-    undoStackRef.current = [];
-    setUndoCount(0);
-    setSpoitMode(false);
-    setStep("완료!");
-    setProcessing(false);
-  }, [original, settings]);
+        const { removeBackground } = await import("@imgly/background-removal");
+
+        setStep("AI 배경 분석 중...");
+        setProgress(50);
+
+        // Convert canvas to blob for the AI library
+        const blob = await new Promise(res => upscaled.toBlob(res, "image/png"));
+        const result = await removeBackground(blob, {
+          progress: (key, current, total) => {
+            if (key === "compute:inference") {
+              setProgress(50 + Math.round((current / total) * 25));
+            }
+          }
+        });
+
+        // Convert result blob back to canvas
+        const img = new Image();
+        const url = URL.createObjectURL(result);
+        await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+        URL.revokeObjectURL(url);
+
+        nobg = document.createElement("canvas");
+        nobg.width = img.width;
+        nobg.height = img.height;
+        nobg.getContext("2d").drawImage(img, 0, 0);
+        setProgress(75);
+      } else {
+        // Fast mode: color-based removal
+        setStep("배경 제거 중...");
+        await new Promise(r => setTimeout(r, 100));
+        nobg = ImageEngine.removeBackground(upscaled, settings.sensitivity, settings.trim);
+        setProgress(75);
+      }
+
+      // Step 3: Auto Crop
+      setStep("자동 크롭 중...");
+      await new Promise(r => setTimeout(r, 100));
+      const cropped = ImageEngine.autoCrop(nobg, settings.padding);
+      setProgress(100);
+
+      setResult(cropped.toDataURL("image/png"));
+      setResultCanvas(cropped);
+      undoStackRef.current = [];
+      setUndoCount(0);
+      setSpoitMode(false);
+      setStep("완료!");
+      setProcessing(false);
+    } catch (err) {
+      console.error(err);
+      setStep("오류 발생");
+      setProcessing(false);
+      if (bgMode === "ai") {
+        setAiStatus("error");
+      }
+    }
+  }, [original, settings, bgMode]);
 
   const download = useCallback(() => {
     if (!result) return;
@@ -532,12 +578,13 @@ export default function ImageStudio() {
   // ─── Styles ────────────────────────────────────────────────────────
   const styles = {
     app: {
-      minHeight: "100vh",
+      height: "100vh",
       background: "#f7f7fb",
       color: "#1a1a2e",
       fontFamily: "'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif",
       display: "flex",
       flexDirection: "column",
+      overflow: "hidden",
     },
     header: {
       padding: "20px 28px",
@@ -578,17 +625,17 @@ export default function ImageStudio() {
       flex: 1,
       display: "flex",
       gap: "0",
+      minHeight: 0,
+      overflow: "hidden",
     },
     sidebar: {
       width: "300px",
       minWidth: "300px",
       borderRight: "1px solid #e0e0ec",
-      padding: "28px 22px",
       display: "flex",
       flexDirection: "column",
-      gap: "28px",
       background: "#fff",
-      overflowY: "auto",
+      overflow: "hidden",
     },
     sectionTitle: {
       fontSize: "12px",
@@ -640,6 +687,7 @@ export default function ImageStudio() {
       padding: "24px",
       position: "relative",
       overflow: "hidden",
+      minHeight: 0,
     },
     dropzone: {
       width: "100%",
@@ -660,6 +708,7 @@ export default function ImageStudio() {
     imageContainer: {
       width: "100%",
       flex: 1,
+      minHeight: 0,
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -774,6 +823,7 @@ export default function ImageStudio() {
       <div style={styles.body}>
         {/* Sidebar */}
         <div style={styles.sidebar}>
+          <div style={{ flex: 1, overflowY: "auto", padding: "28px 22px", display: "flex", flexDirection: "column", gap: "28px" }}>
           <div>
             <div style={styles.sectionTitle}>확대 설정</div>
             <div style={styles.sliderGroup}>
@@ -795,26 +845,63 @@ export default function ImageStudio() {
 
           <div>
             <div style={styles.sectionTitle}>배경 제거</div>
-            <div style={styles.sliderGroup}>
-              <div style={styles.sliderLabel}>
-                <span>감도</span>
-                <span style={{ color: "#6c5ce7", fontWeight: 600 }}>{settings.sensitivity}</span>
-              </div>
-              <input
-                type="range"
-                min="10"
-                max="80"
-                step="1"
-                value={settings.sensitivity}
-                onChange={(e) => setSettings(s => ({ ...s, sensitivity: parseInt(e.target.value) }))}
-                style={styles.slider}
-              />
-              <div style={{ fontSize: "12px", color: "#999aaf", marginTop: "4px" }}>
-                낮을수록 정밀 · 높을수록 공격적
-              </div>
+            <div style={{ display: "flex", gap: "4px", marginBottom: "14px", background: "#f0f0f6", borderRadius: "8px", padding: "3px", border: "1px solid #e0e0ec" }}>
+              <button
+                onClick={() => setBgMode("fast")}
+                style={{
+                  flex: 1, padding: "7px 0", border: "none", borderRadius: "6px", fontSize: "12px",
+                  fontWeight: "600", fontFamily: "inherit", cursor: "pointer",
+                  background: bgMode === "fast" ? "#6c5ce7" : "transparent",
+                  color: bgMode === "fast" ? "#fff" : "#888899",
+                  transition: "all 0.2s",
+                }}
+              >빠른 모드</button>
+              <button
+                onClick={() => setBgMode("ai")}
+                style={{
+                  flex: 1, padding: "7px 0", border: "none", borderRadius: "6px", fontSize: "12px",
+                  fontWeight: "600", fontFamily: "inherit", cursor: "pointer",
+                  background: bgMode === "ai" ? "#6c5ce7" : "transparent",
+                  color: bgMode === "ai" ? "#fff" : "#888899",
+                  transition: "all 0.2s",
+                }}
+              >AI 정밀</button>
             </div>
+            {bgMode === "fast" ? (
+              <div style={styles.sliderGroup}>
+                <div style={styles.sliderLabel}>
+                  <span>감도</span>
+                  <span style={{ color: "#6c5ce7", fontWeight: 600 }}>{settings.sensitivity}</span>
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="80"
+                  step="1"
+                  value={settings.sensitivity}
+                  onChange={(e) => setSettings(s => ({ ...s, sensitivity: parseInt(e.target.value) }))}
+                  style={styles.slider}
+                />
+                <div style={{ fontSize: "12px", color: "#999aaf", marginTop: "4px" }}>
+                  단색 배경에 최적화 · 빠른 처리
+                </div>
+              </div>
+            ) : (
+              <div style={{ fontSize: "12px", color: "#555570", lineHeight: "1.6" }}>
+                AI가 피사체 형태를 인식하여 배경 제거. 복잡한 배경도 처리 가능.
+                {aiStatus === "error" && (
+                  <div style={{ color: "#dc2626", marginTop: "6px" }}>
+                    AI 모델 로드 실패. 배포 환경에서 사용해 주세요.
+                  </div>
+                )}
+                <div style={{ color: "#999aaf", marginTop: "6px", fontSize: "11px" }}>
+                  첫 실행 시 모델 다운로드 (~40MB)
+                </div>
+              </div>
+            )}
           </div>
 
+          {bgMode === "fast" && (
           <div>
             <div style={styles.sectionTitle}>테두리 정리</div>
             <div style={styles.sliderGroup}>
@@ -836,6 +923,7 @@ export default function ImageStudio() {
               </div>
             </div>
           </div>
+          )}
 
           <div>
             <div style={styles.sectionTitle}>자동 크롭</div>
@@ -912,7 +1000,9 @@ export default function ImageStudio() {
             </div>
           )}
 
-          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+          </div>
+
+          <div style={{ padding: "16px 22px", borderTop: "1px solid #e0e0ec", display: "flex", flexDirection: "column", gap: "8px", flexShrink: 0 }}>
             {original && (
               <button
                 onClick={processImage}
@@ -993,6 +1083,7 @@ export default function ImageStudio() {
                 justifyContent: "space-between",
                 alignItems: "center",
                 marginBottom: "12px",
+                flexShrink: 0,
               }}>
                 {result && (
                   <div style={styles.viewToggle}>
@@ -1072,6 +1163,14 @@ export default function ImageStudio() {
                 </div>
               </div>
 
+              {result && (
+                <div style={{ ...styles.dimInfo, marginTop: 0, marginBottom: "8px", flexShrink: 0 }}>
+                  {spoitMode
+                    ? "스포이드 모드 · 제거할 색상 영역을 클릭하세요"
+                    : "스크롤로 확대/축소 · Alt+드래그로 이동 · 가운데 클릭으로 이동"}
+                </div>
+              )}
+
               {/* Image Display */}
               <div
                 ref={containerRef}
@@ -1109,14 +1208,6 @@ export default function ImageStudio() {
               {processing && (
                 <div style={styles.progressBar}>
                   <div style={{ ...styles.progressFill, width: `${progress}%` }} />
-                </div>
-              )}
-
-              {result && (
-                <div style={styles.dimInfo}>
-                  {spoitMode
-                    ? "스포이드 모드 · 제거할 색상 영역을 클릭하세요"
-                    : "스크롤로 확대/축소 · Alt+드래그로 이동 · 가운데 클릭으로 이동"}
                 </div>
               )}
             </>
