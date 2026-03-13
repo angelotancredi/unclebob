@@ -1,5 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
+// Load Pretendard font
+const fontLink = document.createElement("link");
+fontLink.rel = "stylesheet";
+fontLink.href = "https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css";
+document.head.appendChild(fontLink);
 
 // ─── Image Processing Engine ───────────────────────────────────────────
 const ImageEngine = {
@@ -101,12 +106,7 @@ const ImageEngine = {
     const mask = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
       if (visited[i] === 1) {
-        // Soft edge: partially transparent for pixels near threshold
-        if (dist[i] > softEdge) {
-          mask[i] = (dist[i] - softEdge) / (threshold - softEdge) * 0.3;
-        } else {
-          mask[i] = 0.0;
-        }
+        mask[i] = 0.0;
       } else {
         mask[i] = 1.0;
       }
@@ -115,8 +115,13 @@ const ImageEngine = {
     // Erode mask to trim edge residue (trim px)
     const trimmed = trim > 0 ? this._morphOp(mask, w, h, "erode", trim) : mask;
 
-    // Smooth edges for clean anti-aliasing
-    const smoothed = this._blurMask(trimmed, w, h, 2);
+    // Smooth edges for clean anti-aliasing (radius 3 for softer blend)
+    const smoothed = this._blurMask(trimmed, w, h, 3);
+
+    // Clamp: kill low-alpha residue that creates visible halo
+    for (let i = 0; i < w * h; i++) {
+      if (smoothed[i] < 0.15) smoothed[i] = 0;
+    }
 
     // Apply mask
     const out = document.createElement("canvas");
@@ -237,8 +242,10 @@ export default function ImageStudio() {
   const [viewMode, setViewMode] = useState("result"); // "original" | "result"
   const [bgMode, setBgMode] = useState("fast"); // "fast" | "ai"
   const [aiStatus, setAiStatus] = useState(""); // "", "loading", "ready", "error"
-  const [spoitMode, setSpoitMode] = useState(false);
+  const [activeTool, setActiveTool] = useState("none"); // "none" | "spoit" | "lasso"
   const [spoitSensitivity, setSpoitSensitivity] = useState(25);
+  const [lassoPoints, setLassoPoints] = useState([]);
+  const [isDrawingLasso, setIsDrawingLasso] = useState(false);
   const [resultCanvas, setResultCanvas] = useState(null);
   const [undoCount, setUndoCount] = useState(0);
   const [zoom, setZoom] = useState(1);
@@ -354,7 +361,7 @@ export default function ImageStudio() {
       setResultCanvas(cropped);
       undoStackRef.current = [];
       setUndoCount(0);
-      setSpoitMode(false);
+      setActiveTool("none");
       setStep("완료!");
       setProcessing(false);
     } catch (err) {
@@ -395,14 +402,14 @@ export default function ImageStudio() {
     setResultCanvas(null);
     undoStackRef.current = [];
     setUndoCount(0);
-    setSpoitMode(false);
+    setActiveTool("none");
     setProgress(0);
     setStep("");
   }, []);
 
   // Spoid: click on result image to flood-fill remove that color region
   const handleSpoidClick = useCallback((e) => {
-    if (!spoitMode || !resultCanvas || !imgRef.current) return;
+    if (activeTool !== "spoit" || !resultCanvas || !imgRef.current) return;
 
     const img = imgRef.current;
     const rect = img.getBoundingClientRect();
@@ -535,7 +542,7 @@ export default function ImageStudio() {
 
     ctx.putImageData(imageData, 0, 0);
     setResult(resultCanvas.toDataURL("image/png"));
-  }, [spoitMode, resultCanvas, spoitSensitivity]);
+  }, [activeTool, resultCanvas, spoitSensitivity]);
 
   // Undo last spoid action
   const handleUndo = useCallback(() => {
@@ -549,6 +556,110 @@ export default function ImageStudio() {
     setUndoCount(undoStackRef.current.length);
   }, [resultCanvas]);
 
+  // Helper: map screen coords to canvas pixel coords
+  const screenToCanvasCoords = useCallback((clientX, clientY) => {
+    if (!resultCanvas || !imgRef.current) return null;
+    const img = imgRef.current;
+    const rect = img.getBoundingClientRect();
+    const scaleX = resultCanvas.width / img.naturalWidth;
+    const scaleY = resultCanvas.height / img.naturalHeight;
+    const displayScaleX = img.naturalWidth / rect.width;
+    const displayScaleY = img.naturalHeight / rect.height;
+    const px = Math.floor((clientX - rect.left) * displayScaleX * scaleX);
+    const py = Math.floor((clientY - rect.top) * displayScaleY * scaleY);
+    return { px, py };
+  }, [resultCanvas]);
+
+  // Lasso: draw freehand selection to delete area
+  const handleLassoDown = useCallback((e) => {
+    if (activeTool !== "lasso" || !resultCanvas || !imgRef.current || e.button !== 0) return;
+    e.preventDefault();
+    const coords = screenToCanvasCoords(e.clientX, e.clientY);
+    if (!coords) return;
+    setLassoPoints([coords]);
+    setIsDrawingLasso(true);
+  }, [activeTool, resultCanvas, screenToCanvasCoords]);
+
+  const handleLassoMove = useCallback((e) => {
+    if (!isDrawingLasso) return;
+    const coords = screenToCanvasCoords(e.clientX, e.clientY);
+    if (!coords) return;
+    setLassoPoints(prev => [...prev, coords]);
+  }, [isDrawingLasso, screenToCanvasCoords]);
+
+  const handleLassoUp = useCallback(() => {
+    if (!isDrawingLasso || !resultCanvas || lassoPoints.length < 3) {
+      setIsDrawingLasso(false);
+      setLassoPoints([]);
+      return;
+    }
+    setIsDrawingLasso(false);
+
+    const w = resultCanvas.width;
+    const h = resultCanvas.height;
+    const ctx = resultCanvas.getContext("2d");
+
+    // Save undo
+    undoStackRef.current = [...undoStackRef.current, ctx.getImageData(0, 0, w, h)];
+    setUndoCount(undoStackRef.current.length);
+
+    // Create mask canvas and draw filled polygon
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = w;
+    maskCanvas.height = h;
+    const maskCtx = maskCanvas.getContext("2d");
+
+    maskCtx.fillStyle = "#000";
+    maskCtx.beginPath();
+    maskCtx.moveTo(lassoPoints[0].px, lassoPoints[0].py);
+    for (let i = 1; i < lassoPoints.length; i++) {
+      maskCtx.lineTo(lassoPoints[i].px, lassoPoints[i].py);
+    }
+    maskCtx.closePath();
+    maskCtx.fill();
+
+    // Feather the mask edges with blur
+    const maskData = maskCtx.getImageData(0, 0, w, h);
+    const md = maskData.data;
+
+    // Build 0/1 mask from alpha
+    const binMask = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      binMask[i] = md[i * 4 + 3] > 128 ? 1.0 : 0.0;
+    }
+
+    // Blur for feathered edges
+    const blurred = new Float32Array(w * h);
+    const bR = 3;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0, cnt = 0;
+        for (let dy = -bR; dy <= bR; dy++) {
+          for (let dx = -bR; dx <= bR; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+              sum += binMask[ny * w + nx];
+              cnt++;
+            }
+          }
+        }
+        blurred[y * w + x] = sum / cnt;
+      }
+    }
+
+    // Apply: set alpha to 0 inside selection
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const data = imageData.data;
+    for (let i = 0; i < w * h; i++) {
+      if (blurred[i] > 0.01) {
+        data[i * 4 + 3] = Math.round(data[i * 4 + 3] * (1 - blurred[i]));
+      }
+    }
+    ctx.putImageData(imageData, 0, 0);
+    setResult(resultCanvas.toDataURL("image/png"));
+    setLassoPoints([]);
+  }, [isDrawingLasso, resultCanvas, lassoPoints]);
+
   // Zoom with mouse wheel
   const handleWheel = useCallback((e) => {
     e.preventDefault();
@@ -560,12 +671,12 @@ export default function ImageStudio() {
 
   // Pan with middle-click, Alt+click, or regular drag when not in spoid mode
   const handleMouseDown = useCallback((e) => {
-    if (e.button === 1 || (e.altKey && e.button === 0) || (!spoitMode && e.button === 0)) {
+    if (e.button === 1 || (e.altKey && e.button === 0) || (!["spoit","lasso"].includes(activeTool) && e.button === 0)) {
       e.preventDefault();
       setIsPanning(true);
       panStart.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
     }
-  }, [pan, spoitMode]);
+  }, [pan, activeTool]);
 
   const handleMouseMove = useCallback((e) => {
     if (!isPanning) return;
@@ -958,22 +1069,39 @@ export default function ImageStudio() {
 
           {result && (
             <div>
-              <div style={styles.sectionTitle}>스포이드 도구</div>
+              <div style={styles.sectionTitle}>편집 도구</div>
               <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                <button
-                  onClick={() => setSpoitMode(m => !m)}
-                  style={{
-                    ...styles.btn,
-                    padding: "10px 16px",
-                    background: spoitMode ? "#6c5ce7" : "rgba(108, 92, 231, 0.06)",
-                    color: spoitMode ? "#fff" : "#6c5ce7",
-                    border: `1px solid ${spoitMode ? "#6c5ce7" : "rgba(108, 92, 231, 0.2)"}`,
-                    fontSize: "13px",
-                  }}
-                >
-                  {spoitMode ? "💧 스포이드 ON" : "💧 스포이드 OFF"}
-                </button>
-                {spoitMode && (
+                <div style={{ display: "flex", gap: "6px" }}>
+                  <button
+                    onClick={() => setActiveTool(t => t === "spoit" ? "none" : "spoit")}
+                    style={{
+                      ...styles.btn,
+                      flex: 1,
+                      padding: "10px 12px",
+                      background: activeTool === "spoit" ? "#6c5ce7" : "rgba(108, 92, 231, 0.06)",
+                      color: activeTool === "spoit" ? "#fff" : "#6c5ce7",
+                      border: `1px solid ${activeTool === "spoit" ? "#6c5ce7" : "rgba(108, 92, 231, 0.2)"}`,
+                      fontSize: "12px",
+                    }}
+                  >
+                    💧 스포이드
+                  </button>
+                  <button
+                    onClick={() => setActiveTool(t => t === "lasso" ? "none" : "lasso")}
+                    style={{
+                      ...styles.btn,
+                      flex: 1,
+                      padding: "10px 12px",
+                      background: activeTool === "lasso" ? "#6c5ce7" : "rgba(108, 92, 231, 0.06)",
+                      color: activeTool === "lasso" ? "#fff" : "#6c5ce7",
+                      border: `1px solid ${activeTool === "lasso" ? "#6c5ce7" : "rgba(108, 92, 231, 0.2)"}`,
+                      fontSize: "12px",
+                    }}
+                  >
+                    ✂ 라쏘
+                  </button>
+                </div>
+                {activeTool === "spoit" && (
                   <div style={styles.sliderGroup}>
                     <div style={styles.sliderLabel}>
                       <span>제거 범위</span>
@@ -989,8 +1117,13 @@ export default function ImageStudio() {
                       style={styles.slider}
                     />
                     <div style={{ fontSize: "12px", color: "#999aaf", marginTop: "2px" }}>
-                      이미지 클릭 시 해당 색상 영역 제거
+                      클릭 시 해당 색상과 연결된 영역 제거
                     </div>
+                  </div>
+                )}
+                {activeTool === "lasso" && (
+                  <div style={{ fontSize: "12px", color: "#555570", lineHeight: "1.6" }}>
+                    마우스로 드래그하여 영역을 그리면 해당 부분이 삭제됩니다. 가장자리는 자동으로 부드럽게 처리됩니다.
                   </div>
                 )}
                 {undoCount > 0 && (
@@ -1177,8 +1310,10 @@ export default function ImageStudio() {
 
               {result && (
                 <div style={{ ...styles.dimInfo, marginTop: 0, marginBottom: "8px", flexShrink: 0 }}>
-                  {spoitMode
+                  {activeTool === "spoit"
                     ? "스포이드 모드 · 제거할 색상 영역을 클릭하세요"
+                    : activeTool === "lasso"
+                    ? "라쏘 모드 · 드래그로 영역을 그려서 삭제하세요"
                     : "스크롤로 확대/축소 · Alt+드래그로 이동 · 가운데 클릭으로 이동"}
                 </div>
               )}
@@ -1188,17 +1323,29 @@ export default function ImageStudio() {
                 ref={containerRef}
                 style={{
                   ...styles.imageContainer,
-                  cursor: spoitMode && result && viewMode === "result"
+                  cursor: (activeTool === "spoit" || activeTool === "lasso") && result && viewMode === "result"
                     ? "crosshair"
                     : isPanning ? "grabbing" : "grab",
                   overflow: "hidden",
                 }}
-                onClick={spoitMode && viewMode === "result" ? handleSpoidClick : undefined}
+                onClick={activeTool === "spoit" && viewMode === "result" ? handleSpoidClick : undefined}
                 onWheel={handleWheel}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseUp}
+                onMouseDown={(e) => {
+                  if (activeTool === "lasso" && viewMode === "result") handleLassoDown(e);
+                  else handleMouseDown(e);
+                }}
+                onMouseMove={(e) => {
+                  if (isDrawingLasso) handleLassoMove(e);
+                  else handleMouseMove(e);
+                }}
+                onMouseUp={(e) => {
+                  if (isDrawingLasso) handleLassoUp(e);
+                  else handleMouseUp(e);
+                }}
+                onMouseLeave={(e) => {
+                  if (isDrawingLasso) handleLassoUp(e);
+                  else handleMouseUp(e);
+                }}
               >
                 <img
                   ref={imgRef}
@@ -1214,6 +1361,37 @@ export default function ImageStudio() {
                   }}
                   draggable={false}
                 />
+                {/* Lasso overlay */}
+                {lassoPoints.length > 1 && (
+                  <svg
+                    style={{
+                      position: "absolute",
+                      top: 0, left: 0,
+                      width: "100%", height: "100%",
+                      pointerEvents: "none",
+                      zIndex: 10,
+                    }}
+                  >
+                    <polyline
+                      points={lassoPoints.map(p => {
+                        if (!imgRef.current) return "0,0";
+                        const img = imgRef.current;
+                        const rect = img.getBoundingClientRect();
+                        const container = containerRef.current.getBoundingClientRect();
+                        const scaleX = resultCanvas.width / img.naturalWidth;
+                        const scaleY = resultCanvas.height / img.naturalHeight;
+                        const sx = (p.px / scaleX) * (rect.width / img.naturalWidth) + rect.left - container.left;
+                        const sy = (p.py / scaleY) * (rect.height / img.naturalHeight) + rect.top - container.top;
+                        return `${sx},${sy}`;
+                      }).join(" ")}
+                      fill="rgba(239, 68, 68, 0.15)"
+                      stroke="#ef4444"
+                      strokeWidth="2"
+                      strokeDasharray="6 3"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
               </div>
 
               {/* Progress */}
